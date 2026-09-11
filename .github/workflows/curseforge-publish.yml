@@ -1,0 +1,205 @@
+# Publishes a GitHub release's jar to a CurseForge project, with the release notes as the changelog.
+#
+# Reusable — each plugin repository calls it from a short workflow of its own:
+#
+#   on:
+#     release:
+#       types: [published]
+#     workflow_dispatch:
+#       inputs:
+#         tag: { description: "Release tag to (re)publish, e.g. v1.2.0", required: true }
+#         dry-run: { description: "Stop before uploading", type: boolean, default: false }
+#   jobs:
+#     curseforge:
+#       uses: stoshelabs/.github/.github/workflows/curseforge-publish.yml@main
+#       with:
+#         project-id: "123456"
+#         tag: ${{ inputs.tag }}
+#         dry-run: ${{ inputs.dry-run == true }}
+#       secrets:
+#         CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+#
+# Nothing is built here. Our jars compile against a local Hytale install that CI doesn't have, and uploading the
+# release asset keeps the CurseForge file byte-identical to the GitHub one.
+#
+# A jar the CurseForge project already lists under the same file name is skipped: releases are sometimes uploaded
+# by hand, and re-running a release must never create a second copy.
+
+name: Publish to CurseForge
+
+on:
+  workflow_call:
+    inputs:
+      project-id:
+        description: CurseForge project ID (numeric, shown on the project page)
+        type: string
+        required: true
+      tag:
+        description: Release tag to publish; defaults to the release that triggered the caller
+        type: string
+        default: ""
+      jar-pattern:
+        description: Glob matching the one release asset to upload
+        type: string
+        default: "*-hytale-*.jar"
+      game-versions:
+        description: Comma-separated CurseForge game version IDs; empty derives them from the jar's -hytale-<line>
+        type: string
+        default: ""
+      relations:
+        description: "Comma-separated slug:type — optionalDependency, requiredDependency, embeddedLibrary, incompatible, tool"
+        type: string
+        default: ""
+      dry-run:
+        description: Resolve everything and stop before uploading
+        type: boolean
+        default: false
+      skip-duplicate-check:
+        description: Upload even if CurseForge can't be asked whether it already has the file
+        type: boolean
+        default: false
+    secrets:
+      CURSEFORGE_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAG" ]; then
+            echo "::error::No release tag: pass the tag input, or call this from a release event." >&2
+            exit 1
+          fi
+          gh api "repos/$REPO/releases/tags/$TAG" > release.json
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # A GitHub pre-release goes up as a CurseForge beta.
+          if [ "$(jq -r .prerelease release.json)" = true ]; then
+            echo "type=beta" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=release" >> "$GITHUB_OUTPUT"
+          fi
+          jq -r '.body // ""' release.json > changelog.md
+          if [ ! -s changelog.md ]; then
+            echo "Release $TAG" > changelog.md
+          fi
+
+      - name: Download the jar
+        id: jar
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+          PATTERN: ${{ inputs.jar-pattern }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" --repo "$REPO" --pattern "$PATTERN" --dir dist
+          mapfile -t jars < <(ls dist)
+          if [ "${#jars[@]}" -ne 1 ]; then
+            echo "::error::Expected one asset matching '$PATTERN' on $TAG, found ${#jars[@]}: ${jars[*]:-none}" >&2
+            exit 1
+          fi
+          echo "path=dist/${jars[0]}" >> "$GITHUB_OUTPUT"
+          echo "file=${jars[0]}" >> "$GITHUB_OUTPUT"
+          echo "name=${jars[0]%.jar}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether CurseForge already has it
+        id: existing
+        if: ${{ !inputs.skip-duplicate-check }}
+        env:
+          PROJECT_ID: ${{ inputs.project-id }}
+          FILE: ${{ steps.jar.outputs.file }}
+        run: |
+          set -euo pipefail
+          # The listing the CurseForge website reads; it needs no token (the Upload API has no listing of its own).
+          # If it can't be read, stop rather than risk a duplicate — skip-duplicate-check overrides.
+          url="https://www.curseforge.com/api/v1/mods/$PROJECT_ID/files?pageIndex=0&pageSize=50&sort=dateCreated&sortDescending=true&removeAlphas=false"
+          if ! curl -sS --fail --max-time 30 "$url" > files.json || ! jq -e '.data | type == "array"' files.json > /dev/null; then
+            echo "::error::Could not list the files of CurseForge project $PROJECT_ID, so a duplicate can't be ruled out. Re-run later, or run with skip-duplicate-check." >&2
+            exit 1
+          fi
+          match=$(jq -r --arg f "$FILE" \
+            'first(.data[] | select(.fileName == $f or .displayName == $f) | "\(.id), uploaded \(.dateCreated[0:10])") // ""' files.json)
+          if [ -n "$match" ]; then
+            echo "::notice::$FILE is already on CurseForge project $PROJECT_ID (file $match) — not uploading it again."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "CurseForge project $PROJECT_ID does not have $FILE yet."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve the Hytale game versions
+        id: versions
+        if: ${{ steps.existing.outputs.exists != 'true' }}
+        env:
+          EXPLICIT: ${{ inputs.game-versions }}
+          JAR: ${{ steps.jar.outputs.name }}
+        run: |
+          set -euo pipefail
+          # CurseForge's Hytale is game 70216. Its versions are not listed by the Upload API's /api/game/versions,
+          # so the IDs are pinned here — add a line when Hytale ships a new one.
+          if [ -n "$EXPLICIT" ]; then
+            ids="$EXPLICIT"
+          else
+            line=$(sed -nE 's/.*-hytale-([0-9]+\.[0-9]+)$/\1/p' <<< "$JAR")
+            case "$line" in
+              0.5) ids=16404 ;;
+              0.6) ids=16931 ;;
+              *)
+                echo "::error::No CurseForge game version for Hytale line '${line:-?}' (asset $JAR). Add it here or pass game-versions." >&2
+                exit 1
+                ;;
+            esac
+          fi
+          echo "ids=$(jq -cn --arg ids "$ids" '$ids | split(",") | map(tonumber)')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to CurseForge
+        if: ${{ steps.existing.outputs.exists != 'true' }}
+        env:
+          TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          PROJECT_ID: ${{ inputs.project-id }}
+          JAR_PATH: ${{ steps.jar.outputs.path }}
+          # The file name, .jar included — the same display name the hand uploads use.
+          DISPLAY_NAME: ${{ steps.jar.outputs.file }}
+          RELEASE_TYPE: ${{ steps.release.outputs.type }}
+          GAME_VERSIONS: ${{ steps.versions.outputs.ids }}
+          RELATIONS: ${{ inputs.relations }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          relations=$(jq -cn --arg s "$RELATIONS" \
+            '[$s | split(",")[] | select(length > 0) | split(":") | {slug: .[0], type: .[1]}]')
+          jq -n --rawfile changelog changelog.md \
+                --arg displayName "$DISPLAY_NAME" \
+                --arg releaseType "$RELEASE_TYPE" \
+                --argjson gameVersions "$GAME_VERSIONS" \
+                --argjson relations "$relations" \
+            '{changelog: $changelog, changelogType: "markdown", displayName: $displayName,
+              releaseType: $releaseType, gameVersions: $gameVersions}
+             + (if ($relations | length) > 0 then {relations: {projects: $relations}} else {} end)' > metadata.json
+          echo "Metadata (changelog omitted):"
+          jq 'del(.changelog)' metadata.json
+
+          if [ "$DRY_RUN" = true ]; then
+            echo "Dry run: $JAR_PATH was not uploaded to project $PROJECT_ID."
+            exit 0
+          fi
+
+          # legacy.curseforge.com is the host the Hytale tooling uploads through; the file is routed by project ID.
+          curl -sS --fail-with-body -X POST \
+            -H "X-Api-Token: $TOKEN" \
+            -F "metadata=<metadata.json" \
+            -F "file=@$JAR_PATH" \
+            "https://legacy.curseforge.com/api/projects/$PROJECT_ID/upload-file" > response.json
+          echo "Uploaded as CurseForge file $(jq -r .id response.json). It goes live once CurseForge moderation approves it."
